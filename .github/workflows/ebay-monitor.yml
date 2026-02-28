@@ -1,0 +1,44 @@
+name: eBay Ultra Monitor
+
+on:
+  schedule:
+    - cron: "*/2 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ebay-monitor
+  cancel-in-progress: true
+
+jobs:
+  poll:
+    runs-on: ubuntu-latest
+    env:
+      DISCORD_WEBHOOK_PRIORITY: ${{ secrets.DISCORD_WEBHOOK_PRIORITY }}
+      DISCORD_WEBHOOK_CAMERA: ${{ secrets.DISCORD_WEBHOOK_CAMERA }}
+      DISCORD_WEBHOOK_GENERAL: ${{ secrets.DISCORD_WEBHOOK_GENERAL }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: pip install -r requirements.txt
+
+      - name: Poll All Groups
+        run: |
+          GROUP=A python scripts/poll_ebay_rss.py
+
+      - name: Commit updated state
+        run: |
+          git config user.name "github-actions"
+          git config user.email "github-actions@users.noreply.github.com"
+          git add data/seen.json || true
+          git diff --cached --quiet && exit 0
+          git commit -m "Update seen state"
+          git push
