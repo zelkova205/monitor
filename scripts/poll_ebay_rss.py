@@ -1,11 +1,3 @@
-# scripts/poll_ebay_rss.py
-# eBay RSS monitor with:
-# - per-search RSS polling (no HTML scraping)
-# - jitter + shuffled order (stealth)
-# - dedupe via data/seen.json
-# - Discord embeds routed to 3 channels: priority / camera / general
-# - best-effort price + listing-type extraction from RSS description
-
 import json
 import os
 import re
@@ -14,9 +6,9 @@ import random
 import hashlib
 from html import unescape
 from urllib.parse import quote_plus
-import xml.etree.ElementTree as ET
 
 import requests
+import feedparser
 
 SITE_BASE = {
     "US": "https://www.ebay.com",
@@ -38,7 +30,6 @@ UA = "Mozilla/5.0 (compatible; rss-monitor/1.0; +https://github.com/)"
 
 def rss_url(site: str, query: str) -> str:
     base = SITE_BASE[site]
-    # _sop=10 -> newly listed (best for monitoring)
     return f"{base}/sch/i.html?_nkw={quote_plus(query)}&_sop=10&rt=nc&_rss=1"
 
 def load_json(path: str, default):
@@ -64,12 +55,6 @@ def strip_html(s: str) -> str:
     return s
 
 def guess_price(text: str) -> str:
-    """
-    Best-effort extraction. eBay RSS description formats vary a lot.
-    We'll try:
-      - 'EUR 12.34', 'USD 12.34', 'GBP 12.34'
-      - '$12.34', '€12.34', '£12.34'
-    """
     if not text:
         return ""
     patterns = [
@@ -84,11 +69,6 @@ def guess_price(text: str) -> str:
     return ""
 
 def guess_format(text: str, title: str) -> str:
-    """
-    Best-effort listing type:
-    - Auction indicators: auction/bid/bids (English) + common locale hints
-    - BIN indicators: 'Buy It Now' and simple localized cues
-    """
     blob = ((text or "") + " " + (title or "")).lower()
     if any(k in blob for k in ["auction", "bid", "bids", "gebot", "enchère", "enchere", "asta"]):
         return "Auction"
@@ -100,32 +80,31 @@ def discord_post(bucket: str, embed: dict):
     url = WEBHOOKS.get(bucket, "") or WEBHOOKS.get("general", "")
     if not url:
         return
-    payload = {"embeds": [embed]}
-    requests.post(url, json=payload, timeout=20)
+    requests.post(url, json={"embeds": [embed]}, timeout=20)
+
+def looks_like_xml(text: str) -> bool:
+    head = (text or "").lstrip()[:200].lower()
+    return head.startswith("<?xml") or head.startswith("<rss") or head.startswith("<feed")
 
 def main():
     group = os.getenv("GROUP", "A").strip().upper()
 
     cfg = load_json(CFG_PATH, {})
     jobs = cfg.get("groups", {}).get(group, [])
-
     if not jobs:
         print(f"Group {group} has 0 searches.")
         return
 
-    # Stealth: shuffle & jitter
     random.shuffle(jobs)
 
-    seen_list = load_json(SEEN_PATH, [])
-    if not isinstance(seen_list, list):
-        seen_list = []
-    seen = set(seen_list)
+    seen = set(load_json(SEEN_PATH, []))
     new_seen = set(seen)
 
     sess = requests.Session()
     sess.headers.update({
         "User-Agent": UA,
-        "Accept": "application/rss+xml, application/xml;q=0.9, */*;q=0.8"
+        "Accept": "application/rss+xml, application/xml;q=0.9, */*;q=0.8",
+        "Accept-Language": "en-GB,en;q=0.9",
     })
 
     new_count = 0
@@ -134,17 +113,13 @@ def main():
         site = job["site"]
         query = job["query"]
         bucket = (job.get("bucket", "general") or "general").lower().strip()
-
-        if site not in SITE_BASE:
-            print(f"[WARN] Unknown site code: {site} (skipping)")
-            continue
         if bucket not in WEBHOOKS:
             bucket = "general"
 
         url = rss_url(site, query)
 
-        # jitter between requests to avoid looking bot-like
-        time.sleep(random.uniform(1.0, 2.5))
+        # slightly higher jitter to reduce chance of eBay serving interstitial HTML
+        time.sleep(random.uniform(2.0, 5.0))
 
         try:
             r = sess.get(url, timeout=25)
@@ -153,18 +128,28 @@ def main():
             print(f"[WARN] fetch failed: {site} {query} ({e})")
             continue
 
-        try:
-            root = ET.fromstring(r.text)
-        except Exception as e:
-            print(f"[WARN] parse failed: {site} {query} ({e})")
+        # If eBay returns HTML instead of RSS, log a short signature so we can confirm.
+        if not looks_like_xml(r.text):
+            sig = (r.text or "").lstrip().splitlines()[0][:200]
+            print(f"[WARN] non-RSS response: {site} {query} | first line: {sig}")
             continue
 
-        for item in root.findall(".//item")[:25]:
-            title = (item.findtext("title") or "").strip()
-            link = (item.findtext("link") or "").strip()
-            guid = (item.findtext("guid") or link or title).strip()
-            desc_html = (item.findtext("description") or "").strip()
-            pub = (item.findtext("pubDate") or "").strip()
+        feed = feedparser.parse(r.text)
+        if getattr(feed, "bozo", False):
+            # still often usable, but log why parsing complained
+            print(f"[WARN] feed bozo: {site} {query} ({getattr(feed, 'bozo_exception', '')})")
+
+        for entry in (feed.entries or [])[:25]:
+            title = (getattr(entry, "title", "") or "").strip()
+            link = (getattr(entry, "link", "") or "").strip()
+            guid = (getattr(entry, "id", "") or link or title).strip()
+
+            desc_html = (
+                getattr(entry, "summary", "") or
+                getattr(entry, "description", "") or
+                ""
+            )
+            pub = (getattr(entry, "published", "") or getattr(entry, "updated", "") or "").strip()
 
             k = stable_key(site, query, guid, link)
             if k in seen:
@@ -177,20 +162,16 @@ def main():
             price = guess_price(desc_text)
             fmt = guess_format(desc_text, title)
 
-            # Emoji per bucket
-            bucket_emoji = {"priority": "🔥", "camera": "📷", "general": "📦"}.get(bucket, "📦")
+            emoji = {"priority": "🔥", "camera": "📷", "general": "📦"}.get(bucket, "📦")
 
             embed = {
-                "title": (f"{bucket_emoji} {title}")[:256] if title else f"{bucket_emoji} New eBay listing",
+                "title": (f"{emoji} {title}")[:256] if title else f"{emoji} New eBay listing",
                 "url": link,
                 "description": f"**Site:** {site}  •  **Query:** {query}",
-                "fields": [],
+                "fields": [{"name": "Type (best effort)", "value": fmt, "inline": True}],
             }
-
             if price:
-                embed["fields"].append({"name": "Price (best effort)", "value": price, "inline": True})
-            embed["fields"].append({"name": "Type (best effort)", "value": fmt, "inline": True})
-
+                embed["fields"].insert(0, {"name": "Price (best effort)", "value": price, "inline": True})
             if pub:
                 embed["footer"] = {"text": pub}
 
